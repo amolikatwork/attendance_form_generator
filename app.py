@@ -50,70 +50,11 @@ def allowed_file(filename):
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def index():
     """Homepage with navigation to Manual Entry, Upload Excel, and Upload Image."""
     ensure_project_folders()
-    
-    if request.method == "GET":
-        return render_template("index.html")
-
-    # Original upload route logic
-    try:
-        logger.info("[UPLOAD] Request received")
-        
-        uploaded_file = request.files.get("attendance_file")
-        output_format = request.form.get("output_format", "docx").lower()
-        company_name = request.form.get("company_name", "Company Name").strip() or "Company Name"
-
-        logger.info(f"[UPLOAD] Form data parsed: company_name={company_name}, output_format={output_format}")
-
-        if not uploaded_file or uploaded_file.filename == "":
-            return render_template("index.html", error="Please upload an attendance file.")
-
-        if not allowed_file(uploaded_file.filename):
-            return render_template(
-                "index.html",
-                error="Upload a .xlsx, .xls, .png, .jpg, .jpeg, or .pdf file.",
-            )
-
-        if output_format not in OUTPUT_FORMATS:
-            return render_template("index.html", error="Choose a valid output format.")
-
-        job_id = uuid.uuid4().hex
-        safe_name = secure_filename(uploaded_file.filename)
-        upload_path = app.config["UPLOAD_FOLDER"] / f"{job_id}_{safe_name}"
-        job_output_dir = app.config["OUTPUT_FOLDER"] / job_id
-        job_output_dir.mkdir(parents=True, exist_ok=True)
-
-        uploaded_file.save(upload_path)
-        logger.info(f"[UPLOAD] File saved: {upload_path}")
-
-        logger.info("[UPLOAD] Starting parsing")
-        records, month = parse_attendance_file(upload_path)
-        logger.info(f"[UPLOAD] Parsing complete. Found {len(records)} records. Month: {month}")
-        
-        if not records:
-            raise ValueError("No employee attendance records were found.")
-
-        logger.info("[UPLOAD] Word generation started")
-        zip_path = build_employee_documents(
-            records=records,
-            output_dir=job_output_dir,
-            output_format=output_format,
-            company_name=company_name,
-            month=month,
-        )
-        logger.info(f"[UPLOAD] Word saved successfully")
-        logger.info(f"[UPLOAD] Returning file")
-
-        return send_file(zip_path, as_attachment=True, download_name="attendance_forms.zip")
-
-    except Exception as exc:
-        logger.error(f"[UPLOAD] EXCEPTION OCCURRED")
-        logger.error(traceback.format_exc())
-        shutil.rmtree(job_output_dir, ignore_errors=True)
-        return render_template("index.html", error=f"Could not generate forms: {exc}")
+    return render_template("index.html")
 
 
 @app.route("/manual", methods=["GET", "POST"])
@@ -193,6 +134,141 @@ def manual_entry():
         logger.error(traceback.format_exc())
         return render_template("manual.html", reason_options=REASON_OPTIONS,
                              error=f"Error generating document: {exc}")
+
+
+@app.route("/upload-excel", methods=["GET", "POST"])
+def upload_excel():
+    """Upload Excel file and generate attendance forms."""
+    ensure_project_folders()
+    
+    if request.method == "GET":
+        logger.info("[EXCEL] GET request - rendering upload form")
+        return render_template("upload_excel.html")
+    
+    # POST request: Process Excel file
+    try:
+        logger.info("[EXCEL] Request received")
+        
+        uploaded_file = request.files.get("attendance_file")
+        output_format = request.form.get("output_format", "docx").lower()
+        company_name = request.form.get("company_name", "Company Name").strip() or "Company Name"
+
+        logger.info(f"[EXCEL] Form data parsed: company_name={company_name}, output_format={output_format}")
+
+        if not uploaded_file or uploaded_file.filename == "":
+            return render_template("upload_excel.html", error="Please upload an attendance file.")
+
+        if not allowed_file(uploaded_file.filename):
+            return render_template(
+                "upload_excel.html",
+                error="Upload a .xlsx or .xls file.",
+            )
+
+        if output_format not in OUTPUT_FORMATS:
+            return render_template("upload_excel.html", error="Choose a valid output format.")
+
+        job_id = uuid.uuid4().hex
+        safe_name = secure_filename(uploaded_file.filename)
+        upload_path = app.config["UPLOAD_FOLDER"] / f"{job_id}_{safe_name}"
+        job_output_dir = app.config["OUTPUT_FOLDER"] / job_id
+        job_output_dir.mkdir(parents=True, exist_ok=True)
+
+        uploaded_file.save(upload_path)
+        logger.info(f"[EXCEL] File saved: {upload_path}")
+
+        logger.info("[EXCEL] Starting parsing")
+        records, month = parse_attendance_file(upload_path)
+        logger.info(f"[EXCEL] Parsing complete. Found {len(records)} records. Month: {month}")
+        
+        if not records:
+            raise ValueError("No employee attendance records were found.")
+
+        logger.info("[EXCEL] Word generation started")
+        zip_path = build_employee_documents(
+            records=records,
+            output_dir=job_output_dir,
+            output_format=output_format,
+            company_name=company_name,
+            month=month,
+        )
+        logger.info(f"[EXCEL] Word saved successfully")
+        logger.info(f"[EXCEL] Returning file")
+
+        return send_file(zip_path, as_attachment=True, download_name="attendance_forms.zip")
+
+    except Exception as exc:
+        logger.error(f"[EXCEL] EXCEPTION OCCURRED")
+        logger.error(traceback.format_exc())
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        return render_template("upload_excel.html", error=f"Could not generate forms: {exc}")
+
+
+@app.route("/upload-image", methods=["GET", "POST"])
+def upload_image():
+    """Upload image/PDF file and generate attendance forms."""
+    ensure_project_folders()
+    
+    if request.method == "GET":
+        logger.info("[IMAGE] GET request - rendering upload form")
+        return render_template("upload_image.html")
+    
+    # POST request: Process image/PDF file
+    try:
+        logger.info("[IMAGE] Request received")
+        
+        uploaded_file = request.files.get("attendance_file")
+        output_format = request.form.get("output_format", "docx").lower()
+        company_name = request.form.get("company_name", "Company Name").strip() or "Company Name"
+
+        logger.info(f"[IMAGE] Form data parsed: company_name={company_name}, output_format={output_format}")
+
+        if not uploaded_file or uploaded_file.filename == "":
+            return render_template("upload_image.html", error="Please upload a file.")
+
+        file_ext = Path(uploaded_file.filename).suffix.lower()
+        if file_ext not in {".png", ".jpg", ".jpeg", ".pdf"}:
+            return render_template(
+                "upload_image.html",
+                error="Upload a PNG, JPG, JPEG, or PDF file.",
+            )
+
+        if output_format not in OUTPUT_FORMATS:
+            return render_template("upload_image.html", error="Choose a valid output format.")
+
+        job_id = uuid.uuid4().hex
+        safe_name = secure_filename(uploaded_file.filename)
+        upload_path = app.config["UPLOAD_FOLDER"] / f"{job_id}_{safe_name}"
+        job_output_dir = app.config["OUTPUT_FOLDER"] / job_id
+        job_output_dir.mkdir(parents=True, exist_ok=True)
+
+        uploaded_file.save(upload_path)
+        logger.info(f"[IMAGE] File saved: {upload_path}")
+
+        logger.info("[IMAGE] Starting OCR parsing")
+        records, month = parse_attendance_file(upload_path)
+        logger.info(f"[IMAGE] Parsing complete. Found {len(records)} records. Month: {month}")
+        
+        if not records:
+            raise ValueError("No employee attendance records were found. Please check the image quality.")
+
+        logger.info("[IMAGE] Word generation started")
+        zip_path = build_employee_documents(
+            records=records,
+            output_dir=job_output_dir,
+            output_format=output_format,
+            company_name=company_name,
+            month=month,
+        )
+        logger.info(f"[IMAGE] Word saved successfully")
+        logger.info(f"[IMAGE] Returning file")
+
+        return send_file(zip_path, as_attachment=True, download_name="attendance_forms.zip")
+
+    except Exception as exc:
+        logger.error(f"[IMAGE] EXCEPTION OCCURRED")
+        logger.error(traceback.format_exc())
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        return render_template("upload_image.html", error=f"Could not process file: {exc}")
 
 
 if __name__ == "__main__":
