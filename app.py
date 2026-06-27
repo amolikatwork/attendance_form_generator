@@ -1,24 +1,16 @@
-import os
+import shutil
+import uuid
+import traceback
 import logging
 from pathlib import Path
 from datetime import datetime
 
-from flask import Flask, render_template, request, send_file, session, redirect, url_for, flash
+from flask import Flask, render_template, request, send_file, session, jsonify
 from werkzeug.utils import secure_filename
-from flask_mail import Mail
-from flask_apscheduler import APScheduler
 
-from config import config
-from models import db, User, Job, EmailLog
-from utils.attendance_parser import parse_attendance_file, EmployeeRecord, AttendanceIssue
-from utils.document_generator import build_employee_documents, create_single_docx
-from utils.email_service import send_forms_email, send_batch_notification, mail
-from utils.scheduler import start_scheduler, stop_scheduler
-from utils.decorators import login_required
-from routes.auth import auth_bp
-import uuid
-import shutil
-import traceback
+from utils.attendance_parser import parse_attendance_file, EmployeeRecord, AttendanceIssue, apply_attendance_limits
+from utils.document_generator import create_single_docx, convert_to_pdf
+from utils.ocr import extract_text_from_image_or_pdf
 
 # Configure logging
 logging.basicConfig(
@@ -27,22 +19,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app initialization
+# Flask app
 app = Flask(__name__)
-app.config.from_object(config[os.environ.get('FLASK_ENV', 'development')])
+app.config["SECRET_KEY"] = "attendance-form-generator"
+app.config["UPLOAD_FOLDER"] = Path("uploads")
+app.config["OUTPUT_FOLDER"] = Path("outputs")
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
-# Initialize extensions
-db.init_app(app)
-mail.init_app(app)
-
-# Initialize scheduler
-scheduler = APScheduler()
-scheduler.init_app(app)
-
-# Register blueprints
-app.register_blueprint(auth_bp)
-
-# Constants
 ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".pdf"}
 OUTPUT_FORMATS = {"docx", "pdf"}
 
@@ -57,66 +40,61 @@ REASON_OPTIONS = [
 
 
 def ensure_project_folders():
-    """Create runtime folders if this is the first launch."""
-    Path(app.config["UPLOAD_FOLDER"]).mkdir(exist_ok=True)
-    Path(app.config["OUTPUT_FOLDER"]).mkdir(exist_ok=True)
+    """Create runtime folders."""
+    app.config["UPLOAD_FOLDER"].mkdir(exist_ok=True)
+    app.config["OUTPUT_FOLDER"].mkdir(exist_ok=True)
     Path("static").mkdir(exist_ok=True)
-    Path("templates/auth").mkdir(exist_ok=True)
 
 
 def allowed_file(filename):
-    """Validate uploads by extension before saving them."""
+    """Validate uploads by extension."""
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
-
-
-@app.before_request
-def check_session_timeout():
-    """Check if user session has expired."""
-    session.permanent = True
-    app.permanent_session_lifetime = app.config['PERMANENT_SESSION_LIFETIME']
 
 
 @app.route("/", methods=["GET"])
 def index():
-    """Homepage with navigation to Manual Entry, Upload Excel, and Upload Image."""
+    """Home page with 3 modules."""
     ensure_project_folders()
-    
-    # Check if user is logged in
-    if 'user_id' not in session:
-        return redirect(url_for('auth.login'))
-    
-    return render_template("index.html", username=session.get('username'))
+    logger.info("[HOME] GET / - Rendering home page")
+    return render_template("home.html")
 
 
-@app.route("/manual", methods=["GET", "POST"])
-@login_required
-def manual_entry():
-    """Manual entry page for creating attendance correction forms."""
+@app.route("/manual", methods=["GET"])
+def manual():
+    """Manual entry page."""
     ensure_project_folders()
+    logger.info("[MANUAL] GET /manual - Rendering manual entry form")
+    return render_template("manual.html", reason_options=REASON_OPTIONS)
+
+
+@app.route("/generate", methods=["POST"])
+def generate():
+    """Generate Word or PDF document from manual entry."""
+    ensure_project_folders()
+    job_output_dir = None
+    docx_path = None
     
-    if request.method == "GET":
-        logger.info(f"[MANUAL] GET request from user {session.get('username')}")
-        return render_template("manual.html", reason_options=REASON_OPTIONS)
-    
-    # POST request: Generate Word document from manual entry
     try:
-        logger.info("[MANUAL] Request received")
+        logger.info("[MANUAL] POST /generate - Request received")
         
         # Parse form data
-        company_name = request.form.get("company_name", session.get('company_name')).strip() or "Company Name"
+        company_name = request.form.get("company_name", "Company Name").strip() or "Company Name"
         employee_name = request.form.get("employee_name", "").strip()
         employee_code = request.form.get("employee_code", "").strip()
         department = request.form.get("department", "").strip()
         month = request.form.get("month", datetime.now().strftime("%B %Y")).strip()
-        send_email = request.form.get("send_email", False) == "on"
-        email_recipient = request.form.get("email_recipient", "").strip()
+        output_format = request.form.get("output_format", "docx").lower()
         
-        logger.info(f"[MANUAL] Employee information received: {employee_name} ({employee_code}), Dept: {department}, Month: {month}")
+        logger.info(f"[MANUAL] Employee info: {employee_name} ({employee_code}), Dept: {department}, Month: {month}, Format: {output_format}")
         
-        # Validate required fields
+        # Validate
         if not employee_name or not employee_code:
-            return render_template("manual.html", reason_options=REASON_OPTIONS, 
+            return render_template("manual.html", reason_options=REASON_OPTIONS,
                                  error="Employee Name and Code are required.")
+        
+        if output_format not in OUTPUT_FORMATS:
+            return render_template("manual.html", reason_options=REASON_OPTIONS,
+                                 error="Invalid output format.")
         
         # Parse attendance rows
         attendance_dates = request.form.getlist("attendance_date[]")
@@ -136,11 +114,15 @@ def manual_entry():
         # Create employee record
         employee = EmployeeRecord(name=employee_name, code=employee_code, issues=issues)
         
+        # Apply HR rules
+        employee.issues = apply_attendance_limits(employee.issues)
+        logger.info(f"[MANUAL] HR rules applied: {len(employee.issues)} final rows")
+        
         # Generate document
         logger.info("[MANUAL] Word generation started")
         
         job_id = uuid.uuid4().hex
-        job_output_dir = Path(app.config["OUTPUT_FOLDER"]) / job_id
+        job_output_dir = app.config["OUTPUT_FOLDER"] / job_id
         job_output_dir.mkdir(parents=True, exist_ok=True)
         
         docx_path = job_output_dir / f"{employee_code}_{employee_name}.docx"
@@ -155,274 +137,219 @@ def manual_entry():
         
         logger.info(f"[MANUAL] Word document saved: {docx_path}")
         
-        # Log job in database
-        job = Job(
-            job_id=job_id,
-            user_id=session.get('user_id'),
-            job_type='manual',
-            output_format='docx',
-            company_name=company_name,
-            status='completed',
-            employee_count=1,
-            output_file=str(docx_path),
-            completed_at=datetime.utcnow()
-        )
-        db.session.add(job)
-        db.session.commit()
-        
-        # Send email if requested
-        if send_email and email_recipient:
-            email_log = EmailLog(
-                user_id=session.get('user_id'),
-                job_id=job.id,
-                recipient_email=email_recipient
-            )
-            
-            if send_forms_email(email_recipient, f"Attendance Correction Form - {employee_name}", str(docx_path)):
-                email_log.status = 'sent'
-                email_log.sent_at = datetime.utcnow()
-                logger.info(f"[MANUAL] Email sent to {email_recipient}")
+        # Convert to PDF if requested
+        output_file = docx_path
+        if output_format == "pdf":
+            logger.info("[MANUAL] PDF conversion started")
+            pdf_path = convert_to_pdf(str(docx_path))
+            if pdf_path:
+                output_file = Path(pdf_path)
+                logger.info(f"[MANUAL] PDF saved: {output_file}")
             else:
-                email_log.status = 'failed'
-                logger.error(f"[MANUAL] Failed to send email to {email_recipient}")
-            
-            db.session.add(email_log)
-            db.session.commit()
+                logger.warning("[MANUAL] PDF conversion failed, returning DOCX instead")
         
         logger.info("[MANUAL] Sending file to user")
         
         return send_file(
-            docx_path,
+            output_file,
             as_attachment=True,
-            download_name=f"{employee_code}_{employee_name}.docx"
+            download_name=f"{employee_code}_{employee_name}.{output_format}"
         )
     
     except Exception as exc:
         logger.error("[MANUAL] EXCEPTION OCCURRED")
         logger.error(traceback.format_exc())
+        
+        # Clean up on error
+        if job_output_dir:
+            shutil.rmtree(job_output_dir, ignore_errors=True)
+        
         return render_template("manual.html", reason_options=REASON_OPTIONS,
                              error=f"Error generating document: {exc}")
 
 
-@app.route("/upload-excel", methods=["GET", "POST"])
-@login_required
-def upload_excel():
-    """Upload Excel file and generate attendance forms."""
+@app.route("/upload-excel", methods=["GET"])
+def upload_excel_page():
+    """Upload Excel page."""
+    ensure_project_folders()
+    logger.info("[EXCEL] GET /upload-excel - Rendering upload form")
+    return render_template("upload_excel.html")
+
+
+@app.route("/parse-excel", methods=["POST"])
+def parse_excel():
+    """Parse Excel file and return data for manual entry."""
     ensure_project_folders()
     
-    if request.method == "GET":
-        logger.info(f"[EXCEL] GET request from user {session.get('username')}")
-        return render_template("upload_excel.html")
-    
-    # POST request: Process Excel file
     try:
-        logger.info("[EXCEL] Request received")
+        logger.info("[EXCEL] POST /parse-excel - Request received")
         
         uploaded_file = request.files.get("attendance_file")
-        output_format = request.form.get("output_format", "docx").lower()
-        company_name = request.form.get("company_name", session.get('company_name')).strip() or "Company Name"
-        send_email = request.form.get("send_email", False) == "on"
-        email_recipient = request.form.get("email_recipient", "").strip()
-
-        logger.info(f"[EXCEL] Form data parsed: company_name={company_name}, output_format={output_format}")
-
+        
         if not uploaded_file or uploaded_file.filename == "":
-            return render_template("upload_excel.html", error="Please upload an attendance file.")
-
+            return jsonify({"error": "Please upload a file."}), 400
+        
         if not allowed_file(uploaded_file.filename):
-            return render_template(
-                "upload_excel.html",
-                error="Upload a .xlsx or .xls file.",
-            )
-
-        if output_format not in OUTPUT_FORMATS:
-            return render_template("upload_excel.html", error="Choose a valid output format.")
-
+            return jsonify({"error": "Upload a .xlsx or .xls file."}), 400
+        
         job_id = uuid.uuid4().hex
         safe_name = secure_filename(uploaded_file.filename)
-        upload_path = Path(app.config["UPLOAD_FOLDER"]) / f"{job_id}_{safe_name}"
-        job_output_dir = Path(app.config["OUTPUT_FOLDER"]) / job_id
-        job_output_dir.mkdir(parents=True, exist_ok=True)
-
+        upload_path = app.config["UPLOAD_FOLDER"] / f"{job_id}_{safe_name}"
+        
         uploaded_file.save(upload_path)
         logger.info(f"[EXCEL] File saved: {upload_path}")
-
+        
+        # Parse Excel
         logger.info("[EXCEL] Starting parsing")
         records, month = parse_attendance_file(str(upload_path))
         logger.info(f"[EXCEL] Parsing complete. Found {len(records)} records. Month: {month}")
         
         if not records:
-            raise ValueError("No employee attendance records were found.")
-
-        logger.info("[EXCEL] Word generation started")
-        zip_path = build_employee_documents(
-            records=records,
-            output_dir=job_output_dir,
-            output_format=output_format,
-            company_name=company_name,
-            month=month,
-        )
-        logger.info(f"[EXCEL] Word saved successfully")
+            return jsonify({"error": "No employee records found in the Excel file."}), 400
         
-        # Log job in database
-        job = Job(
-            job_id=job_id,
-            user_id=session.get('user_id'),
-            job_type='excel',
-            input_file=safe_name,
-            output_format=output_format,
-            company_name=company_name,
-            status='completed',
-            employee_count=len(records),
-            output_file=zip_path,
-            completed_at=datetime.utcnow()
-        )
-        db.session.add(job)
-        db.session.commit()
+        # Return first employee's data for manual entry
+        first_employee = records[0]
         
-        # Send notification email if requested
-        if send_email and email_recipient:
-            send_batch_notification(email_recipient, {
-                'employee_count': len(records),
-                'status': 'completed',
-                'output_format': output_format
-            })
-        
-        logger.info(f"[EXCEL] Returning file")
-
-        return send_file(zip_path, as_attachment=True, download_name="attendance_forms.zip")
-
+        return jsonify({
+            "success": True,
+            "company_name": "",
+            "employee_name": first_employee.name,
+            "employee_code": first_employee.code,
+            "month": month,
+            "attendance_data": [
+                {"date": issue.date, "reason": issue.reason}
+                for issue in first_employee.issues
+            ],
+            "total_employees": len(records),
+            "message": f"Loaded {len(records)} employees from Excel. First employee displayed below."
+        })
+    
     except Exception as exc:
-        logger.error(f"[EXCEL] EXCEPTION OCCURRED")
+        logger.error("[EXCEL] EXCEPTION OCCURRED")
         logger.error(traceback.format_exc())
-        shutil.rmtree(job_output_dir, ignore_errors=True)
-        return render_template("upload_excel.html", error=f"Could not generate forms: {exc}")
+        return jsonify({"error": f"Error parsing file: {exc}"}), 500
 
 
-@app.route("/upload-image", methods=["GET", "POST"])
-@login_required
-def upload_image():
-    """Upload image/PDF file and generate attendance forms."""
+@app.route("/upload-image", methods=["GET"])
+def upload_image_page():
+    """Upload Image page."""
+    ensure_project_folders()
+    logger.info("[IMAGE] GET /upload-image - Rendering upload form")
+    return render_template("upload_image.html")
+
+
+@app.route("/parse-image", methods=["POST"])
+def parse_image():
+    """Parse image/PDF and return OCR text for manual entry."""
     ensure_project_folders()
     
-    if request.method == "GET":
-        logger.info(f"[IMAGE] GET request from user {session.get('username')}")
-        return render_template("upload_image.html")
-    
-    # POST request: Process image/PDF file
     try:
-        logger.info("[IMAGE] Request received")
+        logger.info("[IMAGE] POST /parse-image - Request received")
         
         uploaded_file = request.files.get("attendance_file")
-        output_format = request.form.get("output_format", "docx").lower()
-        company_name = request.form.get("company_name", session.get('company_name')).strip() or "Company Name"
-        send_email = request.form.get("send_email", False) == "on"
-        email_recipient = request.form.get("email_recipient", "").strip()
-
-        logger.info(f"[IMAGE] Form data parsed: company_name={company_name}, output_format={output_format}")
-
+        
         if not uploaded_file or uploaded_file.filename == "":
-            return render_template("upload_image.html", error="Please upload a file.")
-
+            return jsonify({"error": "Please upload a file."}), 400
+        
         file_ext = Path(uploaded_file.filename).suffix.lower()
         if file_ext not in {".png", ".jpg", ".jpeg", ".pdf"}:
-            return render_template(
-                "upload_image.html",
-                error="Upload a PNG, JPG, JPEG, or PDF file.",
-            )
-
-        if output_format not in OUTPUT_FORMATS:
-            return render_template("upload_image.html", error="Choose a valid output format.")
-
+            return jsonify({"error": "Upload a PNG, JPG, JPEG, or PDF file."}), 400
+        
         job_id = uuid.uuid4().hex
         safe_name = secure_filename(uploaded_file.filename)
-        upload_path = Path(app.config["UPLOAD_FOLDER"]) / f"{job_id}_{safe_name}"
-        job_output_dir = Path(app.config["OUTPUT_FOLDER"]) / job_id
-        job_output_dir.mkdir(parents=True, exist_ok=True)
-
+        upload_path = app.config["UPLOAD_FOLDER"] / f"{job_id}_{safe_name}"
+        
         uploaded_file.save(upload_path)
         logger.info(f"[IMAGE] File saved: {upload_path}")
-
-        logger.info("[IMAGE] Starting OCR parsing")
+        
+        # Extract text via OCR
+        logger.info("[IMAGE] Starting OCR extraction")
+        text = extract_text_from_image_or_pdf(str(upload_path))
+        logger.info(f"[IMAGE] OCR complete. Extracted {len(text)} characters")
+        
+        if not text.strip():
+            return jsonify({"error": "Could not extract text from image. Please try a clearer image."}), 400
+        
+        # Parse extracted text
+        logger.info("[IMAGE] Parsing OCR text")
         records, month = parse_attendance_file(str(upload_path))
         logger.info(f"[IMAGE] Parsing complete. Found {len(records)} records. Month: {month}")
         
         if not records:
-            raise ValueError("No employee attendance records were found. Please check the image quality.")
-
-        logger.info("[IMAGE] Word generation started")
-        zip_path = build_employee_documents(
-            records=records,
-            output_dir=job_output_dir,
-            output_format=output_format,
-            company_name=company_name,
-            month=month,
-        )
-        logger.info(f"[IMAGE] Word saved successfully")
+            return jsonify({"error": "Could not extract employee records from image. Please try a clearer image."}), 400
         
-        # Log job in database
-        job = Job(
-            job_id=job_id,
-            user_id=session.get('user_id'),
-            job_type='image',
-            input_file=safe_name,
-            output_format=output_format,
-            company_name=company_name,
-            status='completed',
-            employee_count=len(records),
-            output_file=zip_path,
-            completed_at=datetime.utcnow()
-        )
-        db.session.add(job)
-        db.session.commit()
+        # Return first employee's data
+        first_employee = records[0]
         
-        # Send notification email if requested
-        if send_email and email_recipient:
-            send_batch_notification(email_recipient, {
-                'employee_count': len(records),
-                'status': 'completed',
-                'output_format': output_format
-            })
-        
-        logger.info(f"[IMAGE] Returning file")
-
-        return send_file(zip_path, as_attachment=True, download_name="attendance_forms.zip")
-
-    except Exception as exc:
-        logger.error(f"[IMAGE] EXCEPTION OCCURRED")
-        logger.error(traceback.format_exc())
-        shutil.rmtree(job_output_dir, ignore_errors=True)
-        return render_template("upload_image.html", error=f"Could not process file: {exc}")
-
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    """User dashboard showing job history."""
-    user_id = session.get('user_id')
-    jobs = Job.query.filter_by(user_id=user_id).order_by(Job.created_at.desc()).limit(20).all()
+        return jsonify({
+            "success": True,
+            "company_name": "",
+            "employee_name": first_employee.name,
+            "employee_code": first_employee.code,
+            "month": month,
+            "attendance_data": [
+                {"date": issue.date, "reason": issue.reason}
+                for issue in first_employee.issues
+            ],
+            "total_employees": len(records),
+            "message": f"Extracted {len(records)} employees from image. First employee displayed below."
+        })
     
-    return render_template('dashboard.html', jobs=jobs)
+    except Exception as exc:
+        logger.error("[IMAGE] EXCEPTION OCCURRED")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": f"Error processing image: {exc}"}), 500
 
 
-@app.errorhandler(404)
-def not_found_error(error):
-    """Handle 404 errors."""
-    return render_template('404.html'), 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    """Handle 500 errors."""
-    db.session.rollback()
-    logger.error(f"Internal error: {error}")
-    return render_template('500.html'), 500
+@app.route("/preview", methods=["POST"])
+def preview():
+    """Preview the document before generation."""
+    try:
+        logger.info("[PREVIEW] POST /preview - Request received")
+        
+        # Parse form data
+        company_name = request.form.get("company_name", "Company Name").strip() or "Company Name"
+        employee_name = request.form.get("employee_name", "").strip()
+        employee_code = request.form.get("employee_code", "").strip()
+        department = request.form.get("department", "").strip()
+        month = request.form.get("month", datetime.now().strftime("%B %Y")).strip()
+        
+        # Parse attendance rows
+        attendance_dates = request.form.getlist("attendance_date[]")
+        attendance_reasons = request.form.getlist("attendance_reason[]")
+        
+        issues = []
+        for date_str, reason in zip(attendance_dates, attendance_reasons):
+            if date_str and reason:
+                issues.append(AttendanceIssue(date=date_str, reason=reason))
+        
+        # Apply HR rules
+        final_issues = apply_attendance_limits(issues)
+        
+        logger.info(f"[PREVIEW] Preview data: {len(final_issues)} rows after HR rules")
+        
+        return jsonify({
+            "success": True,
+            "preview": {
+                "company_name": company_name,
+                "employee_name": employee_name,
+                "employee_code": employee_code,
+                "department": department,
+                "month": month,
+                "date_generated": datetime.now().strftime("%d-%m-%Y"),
+                "issues": [
+                    {"s_no": idx + 1, "date": issue.date, "reason": issue.reason}
+                    for idx, issue in enumerate(final_issues)
+                ]
+            }
+        })
+    
+    except Exception as exc:
+        logger.error("[PREVIEW] EXCEPTION OCCURRED")
+        logger.error(traceback.format_exc())
+        return jsonify({"error": f"Error generating preview: {exc}"}), 500
 
 
 if __name__ == "__main__":
-    with app.app_context():
-        ensure_project_folders()
-        db.create_all()
-        start_scheduler()
-    
-    app.run(debug=app.config['DEBUG'])
+    ensure_project_folders()
+    app.run(debug=True)

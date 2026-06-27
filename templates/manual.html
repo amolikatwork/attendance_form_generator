@@ -14,11 +14,11 @@
         <!-- Header -->
         <div class="mb-4">
           <a href="/" class="btn btn-sm btn-outline-secondary mb-3">
-            <i class="fas fa-arrow-left"></i> Back to Home
+            <i class="fas fa-home"></i> Back to Home
           </a>
-          <p class="eyebrow mb-2">HR Utility</p>
+          <p class="eyebrow mb-2">Attendance Form Generator</p>
           <h1 class="h2 mb-2">Manual Attendance Entry</h1>
-          <p class="text-secondary mb-0">Enter employee attendance information manually and generate a correction form.</p>
+          <p class="text-secondary mb-0">Enter employee attendance information and generate a Word or PDF document.</p>
         </div>
 
         {% if error %}
@@ -32,7 +32,7 @@
           <div class="col-lg-8 mx-auto">
             <div class="card shadow-sm">
               <div class="card-body p-4">
-                <form method="post" id="manualEntryForm" enctype="multipart/form-data">
+                <form method="post" action="/generate" id="manualEntryForm">
                   
                   <!-- Company Information -->
                   <div class="mb-4">
@@ -47,17 +47,6 @@
                         class="form-control" 
                         placeholder="Enter company name"
                         required>
-                    </div>
-                    
-                    <div class="mb-3">
-                      <label for="company_logo" class="form-label">Company Logo (Optional)</label>
-                      <input 
-                        id="company_logo" 
-                        name="company_logo" 
-                        type="file"
-                        class="form-control" 
-                        accept=".png,.jpg,.jpeg">
-                      <div class="form-text">Accepted formats: PNG, JPG, JPEG (Max 5MB)</div>
                     </div>
                   </div>
 
@@ -103,13 +92,14 @@
                       </div>
                       
                       <div class="col-md-6 mb-3">
-                        <label for="month" class="form-label">Month</label>
+                        <label for="month" class="form-label">Month <span class="text-danger">*</span></label>
                         <input 
                           id="month" 
                           name="month" 
                           type="text"
                           class="form-control" 
-                          placeholder="June 2026">
+                          placeholder="June 2026"
+                          required>
                       </div>
                     </div>
                   </div>
@@ -123,7 +113,6 @@
                       <button 
                         type="button" 
                         class="btn btn-sm btn-success" 
-                        id="addRowBtn"
                         onclick="addAttendanceRow()">
                         <i class="fas fa-plus"></i> Add Row
                       </button>
@@ -143,10 +132,21 @@
                         </tbody>
                       </table>
                     </div>
+                  </div>
+
+                  <hr>
+
+                  <!-- Output Format -->
+                  <div class="mb-4">
+                    <h5 class="card-title mb-3"><i class="fas fa-cog"></i> Output Format</h5>
                     
-                    <div class="alert alert-info" role="alert">
-                      <i class="fas fa-info-circle"></i> 
-                      <strong>Policy:</strong> Maximum 3 Mispunch and 3 Early Out per month. Additional issues become Technical Error.
+                    <div class="mb-3">
+                      <label for="output_format" class="form-label">Choose Format <span class="text-danger">*</span></label>
+                      <select id="output_format" name="output_format" class="form-select" required>
+                        <option value="docx">Word (.docx)</option>
+                        <option value="pdf">PDF (.pdf)</option>
+                      </select>
+                      <small class="text-muted">PDF requires LibreOffice or MS Word installed</small>
                     </div>
                   </div>
 
@@ -161,10 +161,16 @@
                       <i class="fas fa-times"></i> Clear
                     </button>
                     <button 
+                      type="button" 
+                      class="btn btn-info" 
+                      onclick="showPreview()">
+                      <i class="fas fa-eye"></i> Preview
+                    </button>
+                    <button 
                       type="submit" 
                       class="btn btn-primary" 
                       id="generateBtn">
-                      <i class="fas fa-file-word"></i> Generate Word
+                      <i class="fas fa-file-word"></i> Generate
                     </button>
                   </div>
                 </form>
@@ -175,11 +181,29 @@
       </div>
     </main>
 
+    <!-- Preview Modal -->
+    <div class="modal fade" id="previewModal" tabindex="-1">
+      <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">Document Preview</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body" id="previewContent">
+            <!-- Preview content will be injected here -->
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            <button type="button" class="btn btn-primary" onclick="submitForm()">Generate & Download</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
       const REASON_OPTIONS = {{ reason_options|tojson }};
 
-      // Add attendance row
       function addAttendanceRow() {
         const tbody = document.getElementById('attendanceBody');
         const rowIndex = tbody.children.length;
@@ -200,30 +224,22 @@
         
         const actionCell = document.createElement('td');
         actionCell.innerHTML = `
-          <button 
-            type="button" 
-            class="btn btn-sm btn-danger" 
-            onclick="deleteRow('row-${rowIndex}')">
-            <i class="fas fa-trash"></i> Delete
+          <button type="button" class="btn btn-sm btn-danger" onclick="deleteRow('row-${rowIndex}')">
+            <i class="fas fa-trash"></i>
           </button>
         `;
         
         row.appendChild(dateCell);
         row.appendChild(reasonCell);
         row.appendChild(actionCell);
-        
         tbody.appendChild(row);
       }
 
-      // Delete attendance row
       function deleteRow(rowId) {
         const row = document.getElementById(rowId);
-        if (row) {
-          row.remove();
-        }
+        if (row) row.remove();
       }
 
-      // Clear form
       function clearForm() {
         if (confirm('Clear all data?')) {
           document.getElementById('manualEntryForm').reset();
@@ -232,7 +248,65 @@
         }
       }
 
-      // Initialize with one empty row
+      function showPreview() {
+        const formData = new FormData(document.getElementById('manualEntryForm'));
+        
+        fetch('/preview', {
+          method: 'POST',
+          body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (data.success) {
+            renderPreview(data.preview);
+            new bootstrap.Modal(document.getElementById('previewModal')).show();
+          } else {
+            alert('Error: ' + data.error);
+          }
+        })
+        .catch(e => alert('Error: ' + e));
+      }
+
+      function renderPreview(preview) {
+        const rows = preview.issues.map(issue => `
+          <tr>
+            <td>${issue.s_no}</td>
+            <td>${issue.date}</td>
+            <td>${issue.reason}</td>
+          </tr>
+        `).join('');
+
+        const html = `
+          <h6>${preview.company_name}</h6>
+          <p class="text-muted small mb-3">Attendance Correction Form</p>
+          <p><strong>Employee Name:</strong> ${preview.employee_name}</p>
+          <p><strong>Employee Code:</strong> ${preview.employee_code}</p>
+          ${preview.department ? `<p><strong>Department:</strong> ${preview.department}</p>` : ''}
+          <p><strong>Month:</strong> ${preview.month}</p>
+          <p><strong>Date:</strong> ${preview.date_generated}</p>
+          
+          <table class="table table-sm table-bordered">
+            <thead>
+              <tr>
+                <th>S.No</th>
+                <th>Date</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows}
+            </tbody>
+          </table>
+        `;
+
+        document.getElementById('previewContent').innerHTML = html;
+      }
+
+      function submitForm() {
+        document.getElementById('manualEntryForm').submit();
+      }
+
+      // Initialize
       document.addEventListener('DOMContentLoaded', function() {
         addAttendanceRow();
       });

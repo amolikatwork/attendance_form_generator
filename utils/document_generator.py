@@ -1,30 +1,9 @@
-import shutil
 from pathlib import Path
 from datetime import datetime
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Inches, Pt, RGBColor
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
-
-def build_employee_documents(records, output_dir, output_format, company_name, month):
-    """Create one form per employee and bundle everything in a ZIP file."""
-    output_dir = Path(output_dir)
-    forms_dir = output_dir / "forms"
-    forms_dir.mkdir(parents=True, exist_ok=True)
-
-    for record in records:
-        docx_path = forms_dir / f"{_safe_filename(record.code)}_{_safe_filename(record.name)}.docx"
-        _create_docx(record, docx_path, company_name, month)
-
-        if output_format == "pdf":
-            _convert_docx_to_pdf(docx_path)
-            docx_path.unlink(missing_ok=True)
-
-    zip_base = output_dir / "attendance_forms"
-    return shutil.make_archive(str(zip_base), "zip", forms_dir)
+from docx.shared import Inches, Pt
 
 
 def create_single_docx(record, path, company_name, month, department=""):
@@ -35,14 +14,9 @@ def create_single_docx(record, path, company_name, month, department=""):
         record: EmployeeRecord object
         path: Output file path
         company_name: Company name
-        month: Month string (e.g., "June 2026")
+        month: Month string
         department: Department name (optional)
     """
-    _create_docx(record, path, company_name, month, department)
-
-
-def _create_docx(record, path, company_name, month, department=""):
-    """Build the employee attendance correction form."""
     document = Document()
 
     # Set margins
@@ -52,7 +26,7 @@ def _create_docx(record, path, company_name, month, department=""):
         section.left_margin = Inches(0.75)
         section.right_margin = Inches(0.75)
 
-    # Company name (title)
+    # Title
     title = document.add_heading(company_name, level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -70,17 +44,16 @@ def _create_docx(record, path, company_name, month, department=""):
     document.add_paragraph(f"Month: {month}")
     document.add_paragraph(f"Date: {datetime.now().strftime('%d-%m-%Y')}")
 
-    # Attendance issues table
+    # Attendance table
     table = document.add_table(rows=1, cols=3)
     table.style = "Table Grid"
     
-    # Header row
+    # Header
     header_cells = table.rows[0].cells
     header_cells[0].text = "S.No"
     header_cells[1].text = "Date"
     header_cells[2].text = "Reason"
     
-    # Make header bold
     for cell in header_cells:
         for paragraph in cell.paragraphs:
             for run in paragraph.runs:
@@ -97,16 +70,14 @@ def _create_docx(record, path, company_name, month, department=""):
     document.add_paragraph("")
     document.add_paragraph("")
 
-    # Signature section
+    # Signature table
     signature_table = document.add_table(rows=2, cols=2)
     signature_table.style = "Table Grid"
     
-    # Row 1: Labels
     sig_cells = signature_table.rows[0].cells
     sig_cells[0].text = "Employee Signature"
     sig_cells[1].text = "HR Signature"
     
-    # Row 2: Space for signatures
     sig_cells = signature_table.rows[1].cells
     sig_cells[0].text = "_" * 30
     sig_cells[1].text = "_" * 30
@@ -114,19 +85,22 @@ def _create_docx(record, path, company_name, month, department=""):
     document.save(path)
 
 
-def _convert_docx_to_pdf(docx_path):
-    """Convert Word to PDF when docx2pdf and Microsoft Word/LibreOffice are available."""
+def convert_to_pdf(docx_path):
+    """
+    Convert DOCX to PDF.
+    Returns path to PDF or None if conversion fails.
+    """
     try:
         from docx2pdf import convert
-
-        convert(str(docx_path), str(docx_path.with_suffix(".pdf")))
-        return
+        pdf_path = docx_path.replace(".docx", ".pdf")
+        convert(docx_path, pdf_path)
+        return pdf_path
     except Exception:
         pass
-
+    
     try:
         import subprocess
-
+        pdf_path = docx_path.replace(".docx", ".pdf")
         subprocess.run(
             [
                 "soffice",
@@ -134,22 +108,15 @@ def _convert_docx_to_pdf(docx_path):
                 "--convert-to",
                 "pdf",
                 "--outdir",
-                str(docx_path.parent),
-                str(docx_path),
+                str(Path(docx_path).parent),
+                docx_path,
             ],
             check=True,
             capture_output=True,
-            text=True,
             timeout=30,
         )
-        return
-    except Exception as exc:
-        raise RuntimeError(
-            "PDF output needs Microsoft Word with docx2pdf or LibreOffice installed."
-        ) from exc
-
-
-def _safe_filename(value):
-    """Keep generated file names portable across operating systems."""
-    cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in str(value))
-    return cleaned.strip("_") or "employee"
+        return pdf_path
+    except Exception:
+        pass
+    
+    return None

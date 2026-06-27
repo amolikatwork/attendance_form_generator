@@ -44,23 +44,3 @@ body {
   background: #1d4ed8;
   border-color: #1d4ed8;
 }
-
-.btn-success {
-  background: #10b981;
-  border-color: #10b981;
-}
-
-.btn-success:hover {
-  background: #059669;
-  border-color: #059669;
-}
-
-.btn-info {
-  background: #06b6d4;
-  border-color: #06b6d4;
-}
-
-.btn-info:hover {
-  background: #0891b2;
-  border-color: #0891b2;
-}
